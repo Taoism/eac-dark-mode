@@ -1,0 +1,11 @@
+build/
+*.obj
+*.pdb
+*.exp
+*.lib
+*.log
+__pycache__/
+NOTES.md
+inspect_pe.py
+res.py
+tools/dlgshots.sh
