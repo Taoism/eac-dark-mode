@@ -44,6 +44,7 @@ static const COLORREF C_CTRL   = RGB(43, 43, 43);    // edit / combo / listbox b
 static const COLORREF C_LIST   = RGB(25, 25, 25);    // list view / log background
 static const COLORREF C_TEXT   = RGB(230, 230, 230);
 static const COLORREF C_DIS    = RGB(128, 128, 128);
+static const COLORREF C_DISLBL = RGB(165, 165, 165);   // disabled text labels: dimmed but readable
 static const COLORREF C_BORDER = RGB(70, 70, 70);
 static const COLORREF C_HOT    = RGB(61, 61, 61);
 static const COLORREF C_PRESS  = RGB(80, 80, 80);
@@ -936,6 +937,45 @@ static void PaintGroup(HWND h, bool fill = false)
     EndPaint(h, &ps);
 }
 
+// Disabled text statics: Windows draws them embossed (grey text + white copy 1px down-right),
+// which smears on a dark background. Paint them flat in a readable grey instead.
+static bool IsDisabledTextStatic(HWND h)
+{
+    LONG st = GetWindowLongW(h, GWL_STYLE);
+    if (!(st & WS_DISABLED)) return false;
+    UINT t = st & SS_TYPEMASK;
+    return t == SS_LEFT || t == SS_CENTER || t == SS_RIGHT || t == SS_LEFTNOWORDWRAP || t == SS_SIMPLE;
+}
+
+static void PaintDisabledStatic(HWND h)
+{
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    RECT rc; GetClientRect(h, &rc);
+    HWND parent = GetParent(h);
+    HBRUSH br = parent ? (HBRUSH)SendMessageW(parent, WM_CTLCOLORSTATIC, (WPARAM)dc, (LPARAM)h) : nullptr;
+    FillRect(dc, &rc, br ? br : g_brBg);
+    LONG st = GetWindowLongW(h, GWL_STYLE);
+    UINT t = st & SS_TYPEMASK;
+    UINT fl = DT_NOCLIP | DT_EXPANDTABS;
+    if (t == SS_CENTER) fl |= DT_CENTER | DT_WORDBREAK;
+    else if (t == SS_RIGHT) fl |= DT_RIGHT | DT_WORDBREAK;
+    else if (t == SS_LEFT) fl |= DT_WORDBREAK;
+    else fl |= DT_SINGLELINE;
+    if (st & SS_NOPREFIX) fl |= DT_NOPREFIX; else fl |= PrefixFlags(h);
+    if (st & SS_CENTERIMAGE) fl = (fl & ~DT_WORDBREAK) | DT_SINGLELINE | DT_VCENTER;
+    if ((st & SS_ELLIPSISMASK) == SS_ENDELLIPSIS) fl |= DT_END_ELLIPSIS;
+    else if ((st & SS_ELLIPSISMASK) == SS_PATHELLIPSIS) fl |= DT_PATH_ELLIPSIS;
+    else if ((st & SS_ELLIPSISMASK) == SS_WORDELLIPSIS) fl |= DT_WORD_ELLIPSIS;
+    wchar_t text[512]; GetWindowTextW(h, text, 512);
+    HFONT oldf = (HFONT)SelectObject(dc, CtlFont(h));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, C_DISLBL);
+    DrawTextW(dc, text, -1, &rc, fl);
+    SelectObject(dc, oldf);
+    EndPaint(h, &ps);
+}
+
 // Drop-down-list combo boxes: the dark theme paints the focused state light, so draw them here.
 static bool IsPlainDropList(HWND h)
 {
@@ -1449,6 +1489,7 @@ static LRESULT SubclassProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp, WinInfo
             if (t == BS_GROUPBOX) { PaintGroup(h); return 0; }
         }
         if (wi.kind == K_COMBO && IsPlainDropList(h)) { PaintCombo(h); return 0; }
+        if (wi.kind == K_STATIC && !wi.wf && IsDisabledTextStatic(h)) { PaintDisabledStatic(h); return 0; }
         if (wi.wf && (wi.kind == K_GENERIC || wi.kind == K_STATIC)) {
             int role = wi.role;
             if (role == 0) {
