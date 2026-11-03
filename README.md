@@ -26,7 +26,8 @@ Switch with **Tools > Light Mode** / **Tools > Dark Mode**; it changes live and 
 The DLL forwards all 44 msacm32 functions to the real `SysWOW64\msacm32.dll`, so audio codecs keep working.
 
 ## What is covered
-- Main window, menus, track list, status bar, cover panel, position slider.
+- Main window, menus, track list (with light track icons), status bar, cover panel, position slider, tooltips.
+- Extracting Audio Data (copy and test): progress bars, Status list, Cancel/Skip buttons, the cancel warning.
 - All option dialogs (EAC, drive, compression, metadata), tabs, check boxes, radio buttons, group boxes,
   edit fields, combo boxes and push buttons, with dark grey borders instead of white ones.
 - The main window's buttons get flat icons in dark mode (light mode keeps EAC's own icons).
@@ -34,7 +35,7 @@ The DLL forwards all 44 msacm32 functions to the real `SysWOW64\msacm32.dll`, so
 - Metadata plugin windows (CUETools DB, MusicBrainz, GD3), which are .NET WinForms.
 - The Windows file and folder dialogs follow your Windows theme and are left alone.
 
-Not yet checked: the extraction progress and log windows during a real rip, and writing a CD.
+Not yet checked: writing a CD.
 
 ### Crash fix: Load CUE Sheet with WinFsp installed
 With [WinFsp](https://winfsp.dev/) installed, EAC (and other 32-bit programs) crashed when opening a file
