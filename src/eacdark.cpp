@@ -109,6 +109,7 @@ struct WinInfo {
     bool wf = false;           // .NET WinForms window (metadata plugins)
     int role = 0;              // WinForms owner-drawn button: MSAA role, -1 unknown
     COLORREF lvBk = CLR_DEFAULT, lvTextBk = CLR_DEFAULT, lvText = CLR_DEFAULT;
+    HIMAGELIST lvImgOrig = nullptr, lvImgDark = nullptr;   // list view small icons: EAC's and our dark copy
 };
 
 static SRWLOCK g_lock = SRWLOCK_INIT;
@@ -434,6 +435,107 @@ static void ThemeOf(HWND h, const wchar_t* darkName)
     SetWindowTheme(h, g_dark ? darkName : nullptr, nullptr);
 }
 
+// ---- list view icons (the track list's note icons are black on grey, made for a white list)
+// HIMAGELIST handles belong to one comctl32 version (5 or 6), so call the image list functions of
+// the comctl32 that owns the list view's window class.
+struct ImageListApi {
+    HIMAGELIST (WINAPI* Duplicate)(HIMAGELIST);
+    int        (WINAPI* GetImageCount)(HIMAGELIST);
+    HICON      (WINAPI* GetIcon)(HIMAGELIST, int, UINT);
+    int        (WINAPI* ReplaceIcon)(HIMAGELIST, int, HICON);
+    BOOL       (WINAPI* Destroy)(HIMAGELIST);
+};
+
+static bool GetImageListApi(HWND lv, ImageListApi& api)
+{
+    HMODULE m = nullptr;
+    void* proc = (void*)GetClassLongPtrW(lv, GCLP_WNDPROC);
+    if (!proc || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)proc, &m))
+        return false;
+    api.Duplicate = (decltype(api.Duplicate))GetProcAddress(m, "ImageList_Duplicate");
+    api.GetImageCount = (decltype(api.GetImageCount))GetProcAddress(m, "ImageList_GetImageCount");
+    api.GetIcon = (decltype(api.GetIcon))GetProcAddress(m, "ImageList_GetIcon");
+    api.ReplaceIcon = (decltype(api.ReplaceIcon))GetProcAddress(m, "ImageList_ReplaceIcon");
+    api.Destroy = (decltype(api.Destroy))GetProcAddress(m, "ImageList_Destroy");
+    return api.Duplicate && api.GetImageCount && api.GetIcon && api.ReplaceIcon && api.Destroy;
+}
+
+// Grey pixels are inverted (black notes -> light, light grey box -> dark grey); coloured pixels stay.
+static HICON DarkIcon(HICON icon)
+{
+    ICONINFO ii{};
+    if (!GetIconInfo(icon, &ii)) return nullptr;
+    BITMAP bm{};
+    GetObjectW(ii.hbmColor ? ii.hbmColor : ii.hbmMask, sizeof bm, &bm);
+    int w = bm.bmWidth, ht = ii.hbmColor ? bm.bmHeight : bm.bmHeight / 2;
+    HICON result = nullptr;
+    if (ii.hbmColor && w > 0 && ht > 0 && w <= 256 && ht <= 256) {
+        BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -ht; bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+        std::vector<DWORD> px(w * ht), mask(w * ht, 0);
+        HDC dc = GetDC(nullptr);
+        bool ok = GetDIBits(dc, ii.hbmColor, 0, ht, px.data(), &bi, DIB_RGB_COLORS) == ht;
+        if (ok && ii.hbmMask) GetDIBits(dc, ii.hbmMask, 0, ht, mask.data(), &bi, DIB_RGB_COLORS);
+        if (ok) {
+            bool alpha = std::any_of(px.begin(), px.end(), [](DWORD p) { return (p >> 24) != 0; });
+            for (int i = 0; i < w * ht; ++i) {
+                DWORD p = px[i];
+                if (alpha ? (p >> 24) == 0 : (mask[i] & 0xFFFFFF) != 0) continue;   // transparent
+                int b = p & 0xFF, g = (p >> 8) & 0xFF, r = (p >> 16) & 0xFF;
+                if (std::max({ r, g, b }) - std::min({ r, g, b }) > 24) continue;   // coloured: keep
+                int l = 240 - ((r + g + b) / 3) * 3 / 4;
+                px[i] = (p & 0xFF000000) | (l << 16) | (l << 8) | l;
+            }
+            HBITMAP color = CreateCompatibleBitmap(dc, w, ht);
+            SetDIBits(dc, color, 0, ht, px.data(), &bi, DIB_RGB_COLORS);
+            ICONINFO ni = ii; ni.hbmColor = color;
+            result = CreateIconIndirect(&ni);
+            DeleteObject(color);
+        }
+        ReleaseDC(nullptr, dc);
+    }
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    if (ii.hbmMask) DeleteObject(ii.hbmMask);
+    return result;
+}
+
+static HIMAGELIST DarkImageList(HWND lv, HIMAGELIST src)
+{
+    ImageListApi api;
+    if (!GetImageListApi(lv, api)) return nullptr;
+    HIMAGELIST dup = api.Duplicate(src);
+    if (!dup) return nullptr;
+    int n = api.GetImageCount(dup);
+    for (int i = 0; i < n && i < 256; ++i) {
+        HICON ic = api.GetIcon(dup, i, ILD_NORMAL);
+        if (!ic) continue;
+        if (HICON dark = DarkIcon(ic)) { api.ReplaceIcon(dup, i, dark); DestroyIcon(dark); }
+        DestroyIcon(ic);
+    }
+    return dup;
+}
+
+static void ApplyListViewIcons(HWND h, const WinInfo& wi, bool dark)
+{
+    HIMAGELIST cur = (HIMAGELIST)SendMessageW(h, LVM_GETIMAGELIST, LVSIL_SMALL, 0);
+    if (dark) {
+        if (!cur || cur == wi.lvImgDark) return;
+        HIMAGELIST d = DarkImageList(h, cur);
+        if (!d) return;
+        HIMAGELIST previous = wi.lvImgDark;
+        AcquireSRWLockExclusive(&g_lock);
+        auto it = g_wins->find(h);
+        if (it != g_wins->end()) { it->second.lvImgOrig = cur; it->second.lvImgDark = d; }
+        ReleaseSRWLockExclusive(&g_lock);
+        SendMessageW(h, LVM_SETIMAGELIST, LVSIL_SMALL, (LPARAM)d);
+        ImageListApi api;
+        if (previous && previous != d && GetImageListApi(h, api)) api.Destroy(previous);   // no longer used by the list
+    } else if (wi.lvImgOrig && cur == wi.lvImgDark) {
+        SendMessageW(h, LVM_SETIMAGELIST, LVSIL_SMALL, (LPARAM)wi.lvImgOrig);
+    }
+}
+
 static void ApplyWindow(HWND h)
 {
     WinInfo wi;
@@ -477,6 +579,7 @@ static void ApplyWindow(HWND h)
         SendMessageW(h, LVM_SETTEXTBKCOLOR, 0, d ? C_LIST : UnmapColor(wi.lvTextBk, COLOR_WINDOWTEXT));
         SendMessageW(h, LVM_SETTEXTCOLOR, 0, d ? C_TEXT : UnmapColor(wi.lvText, COLOR_WINDOWTEXT));
         if (HWND hdr = (HWND)SendMessageW(h, LVM_GETHEADER, 0, 0)) ApplyWindow(hdr);
+        ApplyListViewIcons(h, wi, d);
         break;
     }
     case K_HEADER: ThemeOf(h, L"ItemsView"); break;
@@ -1072,6 +1175,59 @@ static void PaintListBox(HWND h)
     SelectObject(dc, oldf);
 }
 
+// EAC's own tooltip window ("mytooltip", not the common control): a fixed pale yellow face, so with the
+// dark palette its text came out light on yellow. After EAC paints it, map the face to the control grey
+// and the text to light, by each pixel's distance from the face colour (keeps the anti-aliasing).
+static bool IsEacTooltip(HWND h)
+{
+    wchar_t cls[32] = {};
+    GetClassNameW(h, cls, 32);
+    return !_wcsicmp(cls, L"mytooltip");
+}
+
+static void RecolorTooltip(HWND h)
+{
+    RECT rc; GetClientRect(h, &rc);
+    int w = rc.right, ht = rc.bottom;
+    if (w <= 0 || ht <= 0 || w > 2000 || ht > 1000) return;
+    HDC dc = GetDC(h);
+    if (!dc) return;
+    BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -ht; bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (mem && bmp) {
+        HGDIOBJ old = SelectObject(mem, bmp);
+        BitBlt(mem, 0, 0, w, ht, dc, 0, 0, SRCCOPY);
+        GdiFlush();
+        DWORD* px = (DWORD*)bits;
+        int n = w * ht;
+        // the face is the most common colour
+        std::unordered_map<DWORD, int> count;
+        for (int i = 0; i < n; i += 3) ++count[px[i] & 0xFFFFFF];
+        DWORD face = 0; int best = -1;
+        for (auto& c : count) if (c.second > best) { best = c.second; face = c.first; }
+        int fr = (face >> 16) & 0xFF, fg = (face >> 8) & 0xFF, fb = face & 0xFF;
+        auto dist = [&](DWORD p) { return abs((int)((p >> 16) & 0xFF) - fr) + abs((int)((p >> 8) & 0xFF) - fg) + abs((int)(p & 0xFF) - fb); };
+        int maxd = 0;
+        for (int i = 0; i < n; ++i) maxd = std::max(maxd, dist(px[i]));
+        if (Lum(RGB(fr, fg, fb)) > 120) {   // still EAC's light face (not already recoloured)
+            for (int i = 0; i < n; ++i) {
+                int a = maxd < 24 ? 0 : std::min(255, dist(px[i]) * 255 / maxd);
+                COLORREF c = Mix(C_CTRL, C_TEXT, a * 100 / 255);
+                px[i] = (GetRValue(c) << 16) | (GetGValue(c) << 8) | GetBValue(c);
+            }
+            BitBlt(dc, 0, 0, w, ht, mem, 0, 0, SRCCOPY);
+        }
+        SelectObject(mem, old);
+    }
+    if (bmp) DeleteObject(bmp);
+    if (mem) DeleteDC(mem);
+    ReleaseDC(h, dc);
+}
+
 // ---- WinForms (metadata plugin) push buttons: WinForms draws them itself with the light theme,
 // so paint them here. Radio buttons/check boxes share the class, so ask MSAA for the role.
 static int WfButtonRole(HWND h)
@@ -1490,6 +1646,7 @@ static LRESULT SubclassProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp, WinInfo
         if (wi.wf && wi.top) DrawClientEdge(h);
         if (wi.kind == K_LISTVIEW) DrawNcFrame(h, g_brList);
         else if (wi.kind == K_LISTBOX && !wi.wf) DrawNcFrame(h, g_brCtrl);   // WS_BORDER frame: grey, not light
+        else if (wi.kind == K_GENERIC && !wi.wf && IsEacTooltip(h)) DrawNcFrame(h, g_brCtrl);
         else if (wi.kind == K_TRACKBAR) DrawNcFrame(h, g_brBg);
         else if (wi.kind == K_EDIT) DrawNcFrame(h, g_brCtrl, GetFocus() == h ? g_brFocus : g_brBorder);
         return r;
@@ -1539,6 +1696,14 @@ static LRESULT SubclassProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp, WinInfo
         }
         if (wi.kind == K_COMBO && IsPlainDropList(h)) { PaintCombo(h); return 0; }
         if (wi.kind == K_LISTBOX && !wi.wf && IsPlainListBox(h)) { PaintListBox(h); return 0; }
+        if (wi.kind == K_GENERIC && !wi.wf && IsEacTooltip(h)) {
+            ++t_suppress;   // real colours while EAC paints: dark text on its yellow face, then recolour
+            LRESULT r = CallWindowProcW(orig, h, msg, wp, lp);
+            --t_suppress;
+            GdiFlush();
+            RecolorTooltip(h);
+            return r;
+        }
         if (wi.kind == K_STATIC && !wi.wf && IsDisabledTextStatic(h)) { PaintDisabledStatic(h); return 0; }
         if (wi.wf && (wi.kind == K_GENERIC || wi.kind == K_STATIC)) {
             int role = wi.role;
@@ -1627,6 +1792,15 @@ static LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         (msg == LVM_SETBKCOLOR || msg == LVM_SETTEXTBKCOLOR || msg == LVM_SETTEXTCOLOR)) {
         LRESULT r;
         if (HandleListViewColor(h, wi.orig, msg, lp, r)) return r;
+    }
+    if (!wi.applying && wi.kind == K_LISTVIEW && msg == LVM_SETIMAGELIST && wp == LVSIL_SMALL && g_dark) {
+        // EAC sets the track icons when a CD is read: give the list our dark copy instead
+        LRESULT r = CallWindowProcW(wi.orig, h, msg, wp, lp);
+        SetApplying(h, true);
+        WinInfo now;
+        if (GetInfo(h, now)) ApplyListViewIcons(h, now, true);
+        SetApplying(h, false);
+        return r == (LRESULT)wi.lvImgDark ? (LRESULT)wi.lvImgOrig : r;   // EAC gets back its own list, never ours
     }
     return SubclassProcInner(h, msg, wp, lp, wi);
 }
