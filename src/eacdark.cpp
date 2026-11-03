@@ -358,6 +358,51 @@ static void InstallLoaderFix()
     if (void* p = HotPatch(fn, (void*)Hook_LoadLibraryExW)) real_LoadLibraryExW = (fnLoadLibraryExW)p;
 }
 
+// ---- EAC's tooltip window paints a fixed pale yellow face. While it paints, BeginPaint hands EAC a
+// memory DC; EndPaint recolours that to the dark palette and copies it to the window in one blit,
+// so the yellow never reaches the screen (recolouring on screen afterwards flashed).
+static bool RecolorTooltipBits(DWORD* px, int n);   // below
+using fnBeginPaint = HDC (WINAPI*)(HWND, LPPAINTSTRUCT);
+using fnEndPaint = BOOL (WINAPI*)(HWND, const PAINTSTRUCT*);
+static fnBeginPaint real_BeginPaint;
+static fnEndPaint real_EndPaint;
+struct TipPaint { HWND h; HDC real; HDC mem; HBITMAP bmp; HGDIOBJ old; DWORD* bits; int w, ht; bool done; };
+static thread_local TipPaint t_tip;
+static thread_local HWND t_tipWanted;   // set while our WM_PAINT handler runs EAC's tooltip paint
+
+static HDC WINAPI Hook_BeginPaint(HWND h, LPPAINTSTRUCT ps)
+{
+    if (!h || h != t_tipWanted || t_tip.h) return real_BeginPaint(h, ps);
+    InvalidateRect(h, nullptr, FALSE);   // EAC repaints the whole face, so the buffer is complete
+    HDC real = real_BeginPaint(h, ps);
+    if (!real) return real;
+    RECT rc; GetClientRect(h, &rc);
+    BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = std::max(1L, rc.right); bi.bmiHeader.biHeight = -std::max(1L, rc.bottom);
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC mem = CreateCompatibleDC(real);
+    HBITMAP bmp = mem ? CreateDIBSection(real, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    if (!bmp) { if (mem) DeleteDC(mem); return real; }
+    t_tip = { h, real, mem, bmp, SelectObject(mem, bmp), (DWORD*)bits, (int)bi.bmiHeader.biWidth, (int)-bi.bmiHeader.biHeight, false };
+    ps->hdc = mem;
+    return mem;
+}
+
+static BOOL WINAPI Hook_EndPaint(HWND h, const PAINTSTRUCT* ps)
+{
+    if (h && h == t_tip.h) {
+        GdiFlush();
+        RecolorTooltipBits(t_tip.bits, t_tip.w * t_tip.ht);
+        BitBlt(t_tip.real, 0, 0, t_tip.w, t_tip.ht, t_tip.mem, 0, 0, SRCCOPY);
+        SelectObject(t_tip.mem, t_tip.old); DeleteObject(t_tip.bmp); DeleteDC(t_tip.mem);
+        PAINTSTRUCT real = *ps; real.hdc = t_tip.real;
+        t_tip = TipPaint{}; t_tip.done = true;
+        return real_EndPaint(h, &real);
+    }
+    return real_EndPaint(h, ps);
+}
+
 static void InstallHooks()
 {
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
@@ -385,6 +430,10 @@ static void InstallHooks()
     HMODULE exe = GetModuleHandleW(nullptr);
     real_FillRect = (fnFillRect)GetProcAddress(user32, "FillRect");
     PatchIAT(exe, real_FillRect, Hook_FillRect);
+    real_BeginPaint = (fnBeginPaint)GetProcAddress(user32, "BeginPaint");
+    real_EndPaint = (fnEndPaint)GetProcAddress(user32, "EndPaint");
+    int bp = PatchIAT(exe, real_BeginPaint, Hook_BeginPaint), ep = PatchIAT(exe, real_EndPaint, Hook_EndPaint);
+    Log(L"patched EAC.exe BeginPaint=%d EndPaint=%d", bp, ep);
     if (HMODULE cd = GetModuleHandleW(L"comdlg32.dll")) {
         real_GetOpenFileNameW = (fnOFN)GetProcAddress(cd, "GetOpenFileNameW");
         real_GetSaveFileNameW = (fnOFN)GetProcAddress(cd, "GetSaveFileNameW");
@@ -1185,6 +1234,29 @@ static bool IsEacTooltip(HWND h)
     return !_wcsicmp(cls, L"mytooltip");
 }
 
+// Returns false when the pixels are not EAC's light face (already dark: nothing to do).
+static bool RecolorTooltipBits(DWORD* px, int n)
+{
+    if (n <= 0) return false;
+    // the face is the most common colour
+    std::unordered_map<DWORD, int> count;
+    for (int i = 0; i < n; i += 3) ++count[px[i] & 0xFFFFFF];
+    DWORD face = 0; int best = -1;
+    for (auto& c : count) if (c.second > best) { best = c.second; face = c.first; }
+    int fr = (face >> 16) & 0xFF, fg = (face >> 8) & 0xFF, fb = face & 0xFF;
+    if (Lum(RGB(fr, fg, fb)) <= 120) return false;
+    auto dist = [&](DWORD p) { return abs((int)((p >> 16) & 0xFF) - fr) + abs((int)((p >> 8) & 0xFF) - fg) + abs((int)(p & 0xFF) - fb); };
+    int maxd = 0;
+    for (int i = 0; i < n; ++i) maxd = std::max(maxd, dist(px[i]));
+    for (int i = 0; i < n; ++i) {
+        int a = maxd < 24 ? 0 : std::min(255, dist(px[i]) * 255 / maxd);
+        COLORREF c = Mix(C_CTRL, C_TEXT, a * 100 / 255);
+        px[i] = (GetRValue(c) << 16) | (GetGValue(c) << 8) | GetBValue(c);
+    }
+    return true;
+}
+
+// Fallback when EAC painted the tooltip without going through BeginPaint: recolour it on screen.
 static void RecolorTooltip(HWND h)
 {
     RECT rc; GetClientRect(h, &rc);
@@ -1202,25 +1274,7 @@ static void RecolorTooltip(HWND h)
         HGDIOBJ old = SelectObject(mem, bmp);
         BitBlt(mem, 0, 0, w, ht, dc, 0, 0, SRCCOPY);
         GdiFlush();
-        DWORD* px = (DWORD*)bits;
-        int n = w * ht;
-        // the face is the most common colour
-        std::unordered_map<DWORD, int> count;
-        for (int i = 0; i < n; i += 3) ++count[px[i] & 0xFFFFFF];
-        DWORD face = 0; int best = -1;
-        for (auto& c : count) if (c.second > best) { best = c.second; face = c.first; }
-        int fr = (face >> 16) & 0xFF, fg = (face >> 8) & 0xFF, fb = face & 0xFF;
-        auto dist = [&](DWORD p) { return abs((int)((p >> 16) & 0xFF) - fr) + abs((int)((p >> 8) & 0xFF) - fg) + abs((int)(p & 0xFF) - fb); };
-        int maxd = 0;
-        for (int i = 0; i < n; ++i) maxd = std::max(maxd, dist(px[i]));
-        if (Lum(RGB(fr, fg, fb)) > 120) {   // still EAC's light face (not already recoloured)
-            for (int i = 0; i < n; ++i) {
-                int a = maxd < 24 ? 0 : std::min(255, dist(px[i]) * 255 / maxd);
-                COLORREF c = Mix(C_CTRL, C_TEXT, a * 100 / 255);
-                px[i] = (GetRValue(c) << 16) | (GetGValue(c) << 8) | GetBValue(c);
-            }
-            BitBlt(dc, 0, 0, w, ht, mem, 0, 0, SRCCOPY);
-        }
+        if (RecolorTooltipBits((DWORD*)bits, w * ht)) BitBlt(dc, 0, 0, w, ht, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old);
     }
     if (bmp) DeleteObject(bmp);
@@ -1697,11 +1751,13 @@ static LRESULT SubclassProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp, WinInfo
         if (wi.kind == K_COMBO && IsPlainDropList(h)) { PaintCombo(h); return 0; }
         if (wi.kind == K_LISTBOX && !wi.wf && IsPlainListBox(h)) { PaintListBox(h); return 0; }
         if (wi.kind == K_GENERIC && !wi.wf && IsEacTooltip(h)) {
-            ++t_suppress;   // real colours while EAC paints: dark text on its yellow face, then recolour
+            // real colours while EAC paints (dark text on its yellow face) into our buffer; EndPaint recolours
+            ++t_suppress;
+            t_tipWanted = h; t_tip.done = false;
             LRESULT r = CallWindowProcW(orig, h, msg, wp, lp);
+            t_tipWanted = nullptr;
             --t_suppress;
-            GdiFlush();
-            RecolorTooltip(h);
+            if (!t_tip.done) { GdiFlush(); RecolorTooltip(h); }
             return r;
         }
         if (wi.kind == K_STATIC && !wi.wf && IsDisabledTextStatic(h)) { PaintDisabledStatic(h); return 0; }
