@@ -1025,6 +1025,53 @@ static void PaintCombo(HWND h)
     SelectObject(dc, op); DeleteObject(pen);
 }
 
+// Plain (not owner-drawn) list boxes such as the Status list in "Extracting Audio Data": user32 paints
+// some rows and the erased background with light system colours while EAC updates the list, so draw
+// the whole list here: dark background, grey selection, light text.
+static bool IsPlainListBox(HWND h)
+{
+    LONG st = GetWindowLongW(h, GWL_STYLE);
+    return !(st & (LBS_OWNERDRAWFIXED | LBS_OWNERDRAWVARIABLE | LBS_NODATA));
+}
+
+static void PaintListBox(HWND h)
+{
+    MemPaint p(h);
+    HDC dc = p.mem;
+    bool enabled = IsWindowEnabled(h) != 0;
+    bool focus = GetFocus() == h;
+    LONG st = GetWindowLongW(h, GWL_STYLE);
+    bool multi = (st & (LBS_MULTIPLESEL | LBS_EXTENDEDSEL)) != 0;
+    FillRect(dc, &p.rc, g_brCtrl);
+
+    HFONT oldf = (HFONT)SelectObject(dc, CtlFont(h));
+    SetBkMode(dc, TRANSPARENT);
+    UINT fmt = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | ((st & LBS_USETABSTOPS) ? DT_EXPANDTABS : 0);
+    int count = (int)SendMessageW(h, LB_GETCOUNT, 0, 0);
+    int sel = multi ? -1 : (int)SendMessageW(h, LB_GETCURSEL, 0, 0);
+    int caret = (int)SendMessageW(h, LB_GETCARETINDEX, 0, 0);
+    int scroll = (st & WS_HSCROLL) ? GetScrollPos(h, SB_HORZ) : 0;
+    HBRUSH selBrush = CreateSolidBrush(focus ? RGB(11, 92, 173) : C_PRESS);
+    std::vector<wchar_t> buf;
+    for (int i = (int)SendMessageW(h, LB_GETTOPINDEX, 0, 0); i >= 0 && i < count; ++i) {
+        RECT ir{};
+        if (SendMessageW(h, LB_GETITEMRECT, i, (LPARAM)&ir) == LB_ERR || ir.top >= p.rc.bottom) break;
+        bool selected = multi ? SendMessageW(h, LB_GETSEL, i, 0) > 0 : i == sel;
+        if (selected) FillRect(dc, &ir, selBrush);
+        int len = (int)SendMessageW(h, LB_GETTEXTLEN, i, 0);
+        if (len > 0) {
+            buf.assign(len + 1, 0);
+            SendMessageW(h, LB_GETTEXT, i, (LPARAM)buf.data());
+            RECT tr = ir; tr.left += 2 - scroll;
+            SetTextColor(dc, !enabled ? C_DIS : (selected && focus) ? RGB(255, 255, 255) : C_TEXT);
+            DrawTextW(dc, buf.data(), -1, &tr, fmt);
+        }
+        if (focus && i == caret && multi) FrameRect(dc, &ir, g_brBorder);
+    }
+    DeleteObject(selBrush);
+    SelectObject(dc, oldf);
+}
+
 // ---- WinForms (metadata plugin) push buttons: WinForms draws them itself with the light theme,
 // so paint them here. Radio buttons/check boxes share the class, so ask MSAA for the role.
 static int WfButtonRole(HWND h)
@@ -1442,6 +1489,7 @@ static LRESULT SubclassProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp, WinInfo
         DrawMenuLine(h);
         if (wi.wf && wi.top) DrawClientEdge(h);
         if (wi.kind == K_LISTVIEW) DrawNcFrame(h, g_brList);
+        else if (wi.kind == K_LISTBOX && !wi.wf) DrawNcFrame(h, g_brCtrl);   // WS_BORDER frame: grey, not light
         else if (wi.kind == K_TRACKBAR) DrawNcFrame(h, g_brBg);
         else if (wi.kind == K_EDIT) DrawNcFrame(h, g_brCtrl, GetFocus() == h ? g_brFocus : g_brBorder);
         return r;
@@ -1455,6 +1503,7 @@ static LRESULT SubclassProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp, WinInfo
             if (sys) { RECT rc; GetClientRect(h, &rc); FillRect((HDC)wp, &rc, g_brBg); return 1; }
         }
         if (wi.kind == K_TAB || wi.kind == K_STATUS) return 1;
+        if (wi.kind == K_LISTBOX && !wi.wf && IsPlainListBox(h)) return 1;   // PaintListBox fills everything
         if (wi.kind == K_TOOLBAR) { RECT rc; GetClientRect(h, &rc); FillRect((HDC)wp, &rc, g_brBg); return 1; }
         break;
     case WM_PAINT: {
@@ -1489,6 +1538,7 @@ static LRESULT SubclassProcInner(HWND h, UINT msg, WPARAM wp, LPARAM lp, WinInfo
             if (t == BS_GROUPBOX) { PaintGroup(h); return 0; }
         }
         if (wi.kind == K_COMBO && IsPlainDropList(h)) { PaintCombo(h); return 0; }
+        if (wi.kind == K_LISTBOX && !wi.wf && IsPlainListBox(h)) { PaintListBox(h); return 0; }
         if (wi.kind == K_STATIC && !wi.wf && IsDisabledTextStatic(h)) { PaintDisabledStatic(h); return 0; }
         if (wi.wf && (wi.kind == K_GENERIC || wi.kind == K_STATIC)) {
             int role = wi.role;
